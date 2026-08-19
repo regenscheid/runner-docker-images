@@ -27,5 +27,8 @@ run "math baseline"      "texbuild math-lualatex.tex && head -c4 math-lualatex.p
 run "pdflatex baseline"  "texbuild --pdflatex basic-pdflatex.tex && head -c4 basic-pdflatex.pdf | grep -q %PDF"
 run "on-demand install"  "texbuild ondemand.tex && head -c4 ondemand.pdf | grep -q %PDF && grep -q fontawesome5 texbuild-packages.txt"
 run "preinstall list"    "texbuild preinstall.tex && head -c4 preinstall.pdf | grep -q %PDF"
+# NIST tech-pubs workload: \DocumentMetadata tagging (PDF 2.0 / UA-2) with
+# lualatex + the package stack the myst-nist-tech-pubs template uses.
+run "tagged PDF (NIST)"  "texbuild nist-tagged.tex && head -c8 nist-tagged.pdf | grep -q PDF-2.0"
 
 echo "All smoke tests passed."

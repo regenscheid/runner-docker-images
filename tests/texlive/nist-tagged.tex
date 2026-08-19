@@ -1,0 +1,57 @@
+\DocumentMetadata{
+  lang=en-US,
+  pdfversion=2.0,
+  pdfstandard=ua-2,
+  tagging=on,
+}
+\documentclass[12pt,letterpaper]{article}
+\usepackage{fontspec}
+\usepackage{unicode-math}
+\usepackage{amsmath}
+\usepackage{fancyhdr}
+\usepackage[edtable,mathlines]{lineno}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{enumitem}
+\usepackage[breakable]{tcolorbox}
+\usepackage[acronym]{glossaries}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage{hyperref}
+\makeglossaries
+\newacronym{piv}{PIV}{Personal Identity Verification}
+\pagestyle{fancy}
+\fancyhead[L]{NIST SP 800-XX}
+\fancyhead[R]{Tag Probe}
+\begin{document}
+\linenumbers
+\section{Introduction}
+Hello \gls{piv} tagged world~\cite{knuth}. Math: $E = mc^2$ and
+\begin{equation}
+  \int_0^\infty e^{-x^2}\,dx = \frac{\sqrt{\pi}}{2}.
+\end{equation}
+\subsection{Lists}
+\begin{itemize}[nosep]
+  \item alpha
+  \item beta
+\end{itemize}
+\begin{enumerate}
+  \item one
+  \item two
+\end{enumerate}
+\subsection{Box}
+\begin{tcolorbox}[sharp corners, colback=gray!12.5]
+A boxed official paragraph.
+\end{tcolorbox}
+\subsection{Table}
+\begin{longtable}{ll}
+\toprule Key & Value \\ \midrule
+A & 1 \\
+B & 2 \\ \bottomrule
+\end{longtable}
+\printglossary[type=\acronymtype]
+\begin{thebibliography}{9}
+\bibitem{knuth} D. Knuth, \emph{The Art of Computer Programming}.
+\end{thebibliography}
+\end{document}

@@ -168,14 +168,34 @@ resolve_file_to_pkg() {
 
 install_from_manifest() {
   local mf="$1" pkg fails=0
+  local -a wanted=()
   [[ -f "$mf" ]] || die "manifest not found: $mf"
   log "pre-installing packages from $mf"
   while IFS= read -r pkg; do
     pkg="${pkg%%#*}"; pkg="${pkg//[[:space:]]/}"
     [[ -z "$pkg" ]] && continue
     pkg_installed "$pkg" && continue
-    install_pkg "$pkg" || fails=$((fails + 1))
+    wanted+=("$pkg")
   done < "$mf"
+  [[ ${#wanted[@]} -eq 0 ]] && return 0
+  # One tlmgr invocation for the whole list: every run pays a fixed cost to
+  # fetch the remote tlpdb, so per-package installs are ~10x slower. Fall
+  # back to per-package only if the batch fails (e.g. one unknown name).
+  log "batch-installing ${#wanted[@]} package(s): ${wanted[*]}"
+  if tlmgr install "${wanted[@]}" >/dev/null 2>&1; then
+    tlmgr path add >/dev/null 2>&1 || true
+    hash -r
+    for pkg in "${wanted[@]}"; do
+      ATTEMPTED[$pkg]=1
+      INSTALLED_THIS_RUN+=("$pkg")
+      record_manifest "$pkg"
+    done
+    return 0
+  fi
+  log "batch install failed; retrying packages individually"
+  for pkg in "${wanted[@]}"; do
+    install_pkg "$pkg" || fails=$((fails + 1))
+  done
   [[ $fails -eq 0 ]] || { log "$fails package(s) from $mf failed to install"; return 1; }
 }
 

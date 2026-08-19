@@ -1,0 +1,5 @@
+# packages preinstalled by texbuild before building nist-tagged.tex
+# (mirrors the myst-nist-tech-pubs SP 800 template's needs)
+tcolorbox
+pdfcol
+glossaries
