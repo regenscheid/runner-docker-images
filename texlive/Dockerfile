@@ -54,7 +54,15 @@ WORKDIR /tmp/install-tl
 
 # Install TeX Live from the selected repository with a generated profile.
 RUN echo "Installing TeX Live from: ${TL_REPO}" && \
-    curl -fsSL "${TL_REPO}/install-tl-unx.tar.gz" | tar xz --strip-components=1 && \
+    # mirror.ctan.org can redirect to a broken mirror (bad TLS cert, 404);
+    # retry the installer download too - each attempt re-rolls the redirect
+    ok=0 && \
+    for i in 1 2 3 4 5; do \
+      if curl -fsSL --connect-timeout 30 "${TL_REPO}/install-tl-unx.tar.gz" -o /tmp/installer.tar.gz; then ok=1; break; fi; \
+      echo "installer download attempt $i failed; retrying in 10s"; sleep 10; \
+    done && \
+    [ "$ok" = 1 ] && \
+    tar xzf /tmp/installer.tar.gz --strip-components=1 && rm /tmp/installer.tar.gz && \
     { \
       echo "selected_scheme scheme-${TL_SCHEME}"; \
       for c in ${TL_COLLECTIONS}; do echo "$c 1"; done; \
