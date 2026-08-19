@@ -1,0 +1,16 @@
+% On-demand test: none of these are in the slim image; texbuild must
+% discover and tlmgr-install them, then converge.
+\documentclass{article}
+\usepackage{mdframed}          % latexextra
+\usepackage{enumitem}          % latexextra
+\usepackage{fontawesome5}      % fontsextra
+\begin{document}
+\begin{mdframed}
+\faGithub\ Installed on demand.
+\begin{itemize}[label=\faCheck]
+  \item mdframed
+  \item enumitem
+  \item fontawesome5
+\end{itemize}
+\end{mdframed}
+\end{document}

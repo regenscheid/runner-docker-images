@@ -1,0 +1,10 @@
+% Baseline: must build with the packages baked into texlive-slim (lualatex).
+\documentclass{article}
+\usepackage{fontspec}          % collection-latexrecommended
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\begin{document}
+\section{LuaLaTeX baseline}
+Fontspec loaded under Lua\LaTeX. Math: $\int_0^\infty e^{-x^2}\,dx = \frac{\sqrt{\pi}}{2}$.
+\end{document}

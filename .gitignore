@@ -1,0 +1,8 @@
+.DS_Store
+cache-dir/
+*.log
+tests/texlive/*.pdf
+tests/texlive/*.aux
+tests/texlive/*.fls
+tests/texlive/*.fdb_latexmk
+.env

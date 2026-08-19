@@ -1,0 +1,375 @@
+#!/usr/bin/env bash
+#
+# texbuild — compile LaTeX documents, auto-installing missing TeX Live
+#            packages on demand via tlmgr.
+#
+# Designed for the minimal texlive-slim image: the image ships only
+# scheme-basic + luatex + recommended collections; anything else a
+# document needs is resolved from its error log and installed, then the
+# build is retried until it converges (or nothing new can be installed).
+#
+# Usage:
+#   texbuild [options] <main.tex> [-- <extra latexmk args>]
+#   texbuild --from-manifest <file>          # install a package list, no build
+#
+# Preinstall files (auto-detected next to the target .tex file):
+#   <jobname>.packages       per-document package list
+#   texbuild-packages.txt    per-project package list (also the default
+#                            manifest texbuild records discoveries into)
+# Both are plain text, one package per line, '#' comments allowed. They are
+# installed BEFORE the first compile; on-demand discovery still runs after,
+# and anything newly discovered is appended to the manifest — so a project's
+# second build starts from a warm package set.
+#
+# Options:
+#   --engine <e>        lualatex (default) | pdflatex | xelatex
+#   --pdflatex          shorthand for --engine pdflatex
+#   --lualatex          shorthand for --engine lualatex
+#   --xelatex           shorthand for --engine xelatex
+#   --max-passes <n>    max compile/install iterations (default: 12)
+#   --manifest <file>   where to record installed packages
+#                       (default: texbuild-packages.txt next to the .tex file)
+#   --no-manifest       do not record installed packages
+#   --no-preinstall     skip auto-detection of preinstall files
+#   --from-manifest <f> explicitly install packages listed in <f>;
+#                       may be combined with a build
+#   -h, --help          show this help
+#
+# Environment:
+#   TEXBUILD_ENGINE      default engine        (lualatex)
+#   TEXBUILD_MAX_PASSES  default max passes    (12)
+#   TEXBUILD_MANIFEST    default manifest path (overrides auto location)
+#
+# Once a project stabilizes you can bake its packages into an image layer:
+#   RUN texbuild --from-manifest texbuild-packages.txt
+
+set -uo pipefail
+
+ENGINE="${TEXBUILD_ENGINE:-lualatex}"
+MAX_PASSES="${TEXBUILD_MAX_PASSES:-12}"
+MANIFEST="${TEXBUILD_MANIFEST:-}"
+WRITE_MANIFEST=1
+PREINSTALL=1
+FROM_MANIFEST=""
+TEXFILE=""
+EXTRA_ARGS=()
+
+log()  { printf 'texbuild: %s\n' "$*" >&2; }
+die()  { log "ERROR: $*"; exit 1; }
+
+usage() { awk 'NR>1 && !/^#/{exit} NR>1{sub(/^# ?/,""); print}' "$0"; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --engine)         [[ $# -ge 2 && $2 != -* ]] || die "$1 requires a value"; ENGINE="$2"; shift 2 ;;
+    --engine=*)       ENGINE="${1#*=}"; shift ;;
+    --pdflatex)       ENGINE=pdflatex; shift ;;
+    --lualatex)       ENGINE=lualatex; shift ;;
+    --xelatex)        ENGINE=xelatex; shift ;;
+    --max-passes)     [[ $# -ge 2 && $2 != -* ]] || die "$1 requires a value"; MAX_PASSES="$2"; shift 2 ;;
+    --max-passes=*)   MAX_PASSES="${1#*=}"; shift ;;
+    --manifest)       [[ $# -ge 2 && $2 != -* ]] || die "$1 requires a value"; MANIFEST="$2"; shift 2 ;;
+    --manifest=*)     MANIFEST="${1#*=}"; shift ;;
+    --no-manifest)    WRITE_MANIFEST=0; shift ;;
+    --no-preinstall)  PREINSTALL=0; shift ;;
+    --from-manifest)  [[ $# -ge 2 && $2 != -* ]] || die "$1 requires a value"; FROM_MANIFEST="$2"; shift 2 ;;
+    --from-manifest=*) FROM_MANIFEST="${1#*=}"; shift ;;
+    -h|--help)        usage; exit 0 ;;
+    --)               shift; EXTRA_ARGS+=("$@"); break ;;
+    -*)               die "unknown option: $1 (use -- to pass args to latexmk)" ;;
+    *)                [[ -n "$TEXFILE" ]] && die "only one main .tex file supported"; TEXFILE="$1"; shift ;;
+  esac
+done
+
+case "$ENGINE" in
+  lualatex) ENGINE_FLAG="-lualatex" ;;
+  pdflatex) ENGINE_FLAG="-pdf" ;;
+  xelatex)  ENGINE_FLAG="-xelatex" ;;
+  *)        die "unsupported engine: $ENGINE" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# tlmgr helpers
+# ---------------------------------------------------------------------------
+
+INSTALLED_THIS_RUN=()
+declare -A ATTEMPTED=()   # packages we already tried to install (or failed to)
+declare -A RESOLVED=()    # missing-file -> already handled
+
+check_tree_writable() {
+  local tree
+  tree="$(kpsewhich -var-value TEXMFDIST 2>/dev/null)" || return 0
+  if [[ -n "$tree" && ! -w "$tree" ]]; then
+    log "WARNING: TeX Live tree ($tree) is not writable by $(id -un);"
+    log "         on-demand installation will fail. Run as a user that owns"
+    log "         the tree (the runner images chown it to 'runner')."
+  fi
+}
+
+record_manifest() {
+  [[ "$WRITE_MANIFEST" -eq 1 && -n "$MANIFEST" ]] || return 0
+  local pkg="$1"
+  touch "$MANIFEST" 2>/dev/null || { log "cannot write manifest $MANIFEST"; return 0; }
+  grep -qxF "$pkg" "$MANIFEST" 2>/dev/null || printf '%s\n' "$pkg" >> "$MANIFEST"
+}
+
+pkg_installed() {
+  tlmgr info --only-installed --data name "$1" 2>/dev/null | grep -qx "$1"
+}
+
+install_pkg() {
+  local pkg="$1"
+  [[ -n "${ATTEMPTED[$pkg]:-}" ]] && return 1
+  ATTEMPTED[$pkg]=1
+  log "installing package: $pkg"
+  local attempt
+  for attempt in 1 2 3; do
+    if tlmgr install "$pkg" >/dev/null 2>&1; then
+      # link any new binaries into sys_bin (biber, xindy, ...)
+      tlmgr path add >/dev/null 2>&1 || true
+      hash -r
+      INSTALLED_THIS_RUN+=("$pkg")
+      record_manifest "$pkg"
+      return 0
+    fi
+    # transient mirror failures are common; unknown packages also land here,
+    # so keep the retry count low
+    (( attempt < 3 )) && { log "tlmgr install $pkg failed (attempt $attempt/3); retrying"; sleep 2; }
+  done
+  log "tlmgr could not install: $pkg"
+  return 1
+}
+
+# Map a missing file (foo.sty, bar.cls, baz.tfm, …) to the TL package
+# providing it, using tlmgr's global file search. mirror.ctan.org
+# round-robins and individual mirrors are sometimes broken, so retry —
+# each attempt re-resolves to a (usually different) mirror.
+resolve_file_to_pkg() {
+  local file="$1" out attempt
+  for attempt in 1 2 3; do
+    if out="$(tlmgr search --global --file "/$file" 2>/dev/null)"; then
+      break
+    fi
+    log "tlmgr search failed (attempt $attempt/3); retrying"
+    out=""
+    sleep 2
+  done
+  printf '%s\n' "$out" | awk -v f="$file" '
+    /^[^ \t].*:[ \t]*$/ { pkg=$0; sub(/:[ \t]*$/, "", pkg); next }
+    /^[ \t]/ {
+      n = split($1, a, "/")
+      if (a[n] == f && pkg != "") {
+        sub(/\..*$/, "", pkg)   # strip arch suffix (foo.x86_64-linux -> foo)
+        print pkg
+        exit
+      }
+    }'
+}
+
+install_from_manifest() {
+  local mf="$1" pkg fails=0
+  [[ -f "$mf" ]] || die "manifest not found: $mf"
+  log "pre-installing packages from $mf"
+  while IFS= read -r pkg; do
+    pkg="${pkg%%#*}"; pkg="${pkg//[[:space:]]/}"
+    [[ -z "$pkg" ]] && continue
+    pkg_installed "$pkg" && continue
+    install_pkg "$pkg" || fails=$((fails + 1))
+  done < "$mf"
+  [[ $fails -eq 0 ]] || { log "$fails package(s) from $mf failed to install"; return 1; }
+}
+
+# ---------------------------------------------------------------------------
+# error-log scraping
+# ---------------------------------------------------------------------------
+
+# Print missing file names found in the given file(s), one per line.
+scan_missing_files() {
+  # Patterns cover:
+  #   ! LaTeX Error: File `foo.sty' not found.
+  #   LaTeX Error: File `foo.cls' not found.        (nonstopmode summary)
+  #   ! I can't find file `foo.tex'.
+  #   ! Font \x=somefont at 10pt not loadable: Metric (TFM) file not found
+  #   !pdfTeX error: ... (file foo.map): cannot open ...
+  #   Package biblatex Info: ... file 'foo.bbx' not found
+  sed -n \
+    -e "s/.*File \`\([^']*\)' not found.*/\1/p" \
+    -e 's/.*File "\([^"]*\)" not found.*/\1/p' \
+    -e "s/.*I can't find file \`\([^']*\)'.*/\1/p" \
+    -e "s/.*Font [^=]*=\([^ ]*\).* not loadable: Metric (TFM) file not found.*/\1.tfm/p" \
+    -e "s/.*Font [^=]*=\([^ ]*\).* not loadable: metric data not found or bad.*/\1.tfm/p" \
+    -e "s/.*Font [^=]*=\([^ ]*\).* not loadable: Metric (TFM) file or installed font not found.*/\1.tfm/p" \
+    -e 's/.*!pdfTeX error:.*(file \([^)]*\)): cannot open.*/\1/p' \
+    -e "s/.*file '\([^']*\)' not found.*/\1/p" \
+    "$@" 2>/dev/null \
+  | while IFS= read -r f; do
+      f="${f##*/}"
+      # files reported without extension: assume .tex inputs, skip otherwise
+      [[ "$f" == *.* ]] || f="$f.tex"
+      printf '%s\n' "$f"
+    done | sort -u
+}
+
+# Print missing executables reported by latexmk/shell, one per line.
+scan_missing_binaries() {
+  sed -n \
+    -e 's/.*sh: [0-9]*: \([A-Za-z0-9_.+-]*\): not found.*/\1/p' \
+    -e 's/.*: \([A-Za-z0-9_.+-][A-Za-z0-9_.+-]*\): command not found.*/\1/p' \
+    -e 's/^\([A-Za-z0-9_.+-][A-Za-z0-9_.+-]*\): command not found.*/\1/p' \
+    "$@" 2>/dev/null | sort -u
+}
+
+# Fonts requested by fontspec/luaotfload that aren't present. Best effort:
+# try common file spellings of the font name.
+scan_missing_fonts() {
+  sed -n \
+    -e 's/.*fontspec Error: The font "\([^"]*\)" cannot be found.*/\1/p' \
+    -e "s/.*luaotfload.*font '\([^']*\)' not found.*/\1/p" \
+    "$@" 2>/dev/null | sort -u
+}
+
+try_font() {
+  local name="$1" base cand pkg
+  base="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | tr -d ' ')"
+  for cand in "$base.otf" "$base.ttf" "$base-regular.otf" "${base}regular.otf"; do
+    pkg="$(resolve_file_to_pkg "$cand")"
+    if [[ -n "$pkg" ]]; then
+      install_pkg "$pkg" && return 0
+    fi
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+command -v latexmk >/dev/null || die "latexmk not found on PATH"
+command -v tlmgr   >/dev/null || die "tlmgr not found on PATH"
+
+if [[ -z "$TEXFILE" ]]; then
+  # install-only invocation: fail if anything could not be installed, so
+  # image-bake steps (RUN texbuild --from-manifest ...) can't silently no-op
+  if [[ -n "$FROM_MANIFEST" ]]; then
+    check_tree_writable
+    install_from_manifest "$FROM_MANIFEST"
+    exit $?
+  fi
+  usage; exit 2
+fi
+[[ -f "$TEXFILE" ]] || die "no such file: $TEXFILE"
+check_tree_writable
+
+TEXDIR="$(dirname "$TEXFILE")"
+JOBNAME="$(basename "$TEXFILE")"
+JOBNAME="${JOBNAME%.*}"
+
+# Default manifest lives next to the target, so discoveries recorded on one
+# run are preinstalled on the next.
+[[ -z "$MANIFEST" ]] && MANIFEST="$TEXDIR/texbuild-packages.txt"
+
+# Preinstall: explicit manifest first, then auto-detected files.
+[[ -n "$FROM_MANIFEST" ]] && { install_from_manifest "$FROM_MANIFEST" || log "continuing despite preinstall failures"; }
+if [[ "$PREINSTALL" -eq 1 ]]; then
+  for pf in "$TEXDIR/$JOBNAME.packages" "$MANIFEST"; do
+    [[ -f "$pf" && "$pf" != "$FROM_MANIFEST" ]] || continue
+    install_from_manifest "$pf" || log "continuing despite preinstall failures"
+  done
+fi
+
+OUTTMP="$(mktemp "${TMPDIR:-/tmp}/texbuild.XXXXXX")"
+trap 'rm -f "$OUTTMP"' EXIT
+
+# Locate the .log file. latexmk runs with -cd, so relative -outdir/-auxdir
+# values resolve against the .tex file's directory; the .log lands in the
+# aux dir when one is given, else the output dir.
+OUTDIR=""
+AUXDIR=""
+for a in ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}; do
+  case "$a" in
+    -output-directory=*|--output-directory=*|-outdir=*|--outdir=*) OUTDIR="${a#*=}" ;;
+    -aux-directory=*|--aux-directory=*|-auxdir=*|--auxdir=*)       AUXDIR="${a#*=}" ;;
+  esac
+done
+LOGDIR="${AUXDIR:-$OUTDIR}"
+if [[ -n "$LOGDIR" ]]; then
+  [[ "$LOGDIR" == /* ]] || LOGDIR="$TEXDIR/$LOGDIR"
+else
+  LOGDIR="$TEXDIR"
+fi
+LOGFILE="$LOGDIR/$JOBNAME.log"
+
+status=1
+for (( pass=1; pass<=MAX_PASSES; pass++ )); do
+  # After a failed pass latexmk sees unchanged sources and refuses to rerun
+  # the engine, so retries would just replay the cached failure; -g forces
+  # a real recompile once we've installed something.
+  force=()
+  (( pass > 1 )) && force=(-g)
+  log "pass $pass/$MAX_PASSES: latexmk $ENGINE_FLAG ${force[*]:-} $TEXFILE"
+  latexmk "$ENGINE_FLAG" -interaction=nonstopmode -file-line-error \
+    -cd ${force[@]+"${force[@]}"} ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} "$TEXFILE" >"$OUTTMP" 2>&1
+  status=$?
+
+  if [[ $status -eq 0 ]]; then
+    log "build succeeded on pass $pass"
+    if [[ ${#INSTALLED_THIS_RUN[@]} -gt 0 ]]; then
+      log "packages installed on demand: ${INSTALLED_THIS_RUN[*]}"
+      [[ "$WRITE_MANIFEST" -eq 1 ]] && log "manifest: $MANIFEST"
+    fi
+    exit 0
+  fi
+
+  scan_sources=("$OUTTMP")
+  [[ -f "$LOGFILE" ]] && scan_sources+=("$LOGFILE")
+
+  progress=0
+
+  # 1) missing input files -> package providing them
+  while IFS= read -r f; do
+    [[ -z "$f" || -n "${RESOLVED[$f]:-}" ]] && continue
+    RESOLVED[$f]=1
+    pkg="$(resolve_file_to_pkg "$f")"
+    if [[ -n "$pkg" ]]; then
+      log "missing file $f -> package $pkg"
+      install_pkg "$pkg" && progress=1
+    else
+      log "missing file $f: no providing package found (project file?)"
+    fi
+  done < <(scan_missing_files "${scan_sources[@]}")
+
+  # 2) missing executables (biber, xindy, makeglossaries, …)
+  while IFS= read -r b; do
+    [[ -z "$b" || -n "${RESOLVED[bin:$b]:-}" ]] && continue
+    RESOLVED[bin:$b]=1
+    case "$b" in
+      makeglossaries|makeglossaries-lite) pkg=glossaries ;;
+      *) pkg="$b" ;;
+    esac
+    log "missing executable $b -> trying package $pkg"
+    install_pkg "$pkg" && progress=1
+  done < <(scan_missing_binaries "${scan_sources[@]}")
+
+  # 3) missing fonts (fontspec / luaotfload)
+  fonts_updated=0
+  while IFS= read -r fnt; do
+    [[ -z "$fnt" || -n "${RESOLVED[font:$fnt]:-}" ]] && continue
+    RESOLVED[font:$fnt]=1
+    log "missing font: $fnt"
+    try_font "$fnt" && { progress=1; fonts_updated=1; }
+  done < <(scan_missing_fonts "${scan_sources[@]}")
+  if [[ $fonts_updated -eq 1 && "$ENGINE" == "lualatex" ]]; then
+    log "refreshing luaotfload font database"
+    luaotfload-tool -u >/dev/null 2>&1 || true
+  fi
+
+  if [[ $progress -eq 0 ]]; then
+    log "build failed and no further missing packages could be resolved"
+    break
+  fi
+done
+
+log "---- last 40 lines of latexmk output ----"
+tail -n 40 "$OUTTMP" >&2
+[[ -f "$LOGFILE" ]] && log "full log: $LOGFILE"
+exit "$status"

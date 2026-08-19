@@ -1,0 +1,22 @@
+% Math regression: everything here must build from BAKED-IN packages
+% (collection-mathscience + lm-math), zero on-demand installs.
+\documentclass{article}
+\usepackage{amsmath}
+\usepackage{mathtools}
+\usepackage{unicode-math}
+\setmathfont{Latin Modern Math}
+\DeclarePairedDelimiter{\norm}{\lVert}{\rVert}
+\DeclarePairedDelimiter{\abs}{\lvert}{\rvert}
+\begin{document}
+\section{Math baseline}
+\begin{align}
+  \nabla \cdot \mathbf{E} &= \frac{\rho}{\varepsilon_0} &
+  \oint_{\partial\Omega} \omega &= \int_\Omega d\omega
+\end{align}
+\[
+  \norm{x}_p \coloneqq \Bigl(\sum_{i=1}^n \abs{x_i}^p\Bigr)^{1/p},
+  \qquad
+  \mathbb{E}[X] = \int_{-\infty}^{\infty} x\,f(x)\,dx
+\]
+where \(\norm{\cdot}\) and \(\abs{\cdot}\) come from mathtools' \verb|\DeclarePairedDelimiter|.
+\end{document}

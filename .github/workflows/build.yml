@@ -1,0 +1,336 @@
+name: Build images
+
+# Release pipeline:
+#   1. build: each image is built NATIVELY per platform (amd64 on
+#      ubuntu-latest, arm64 on ubuntu-24.04-arm — no QEMU), pushed by digest,
+#      and merged into a multi-arch candidate tag :build-<run_id>
+#      (see _build-image.yml)
+#   2. test: candidates are exercised on BOTH architectures
+#   3. promote: only if every test passes, candidates are retagged to
+#      :latest / :YYYYMMDD / :runner-<version> (manifest-only, no rebuild)
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly rebuild so runner images track upstream actions/runner releases
+    # (stale runners eventually get refused by GitHub) and texlive-slim
+    # tracks the current TL release.
+    - cron: "17 5 * * 1"
+  push:
+    branches: [main]
+    paths:
+      - "images/**"
+      - "texlive/**"
+      - "tests/**"
+      - ".github/workflows/**"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-images
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------- versions
+  # Resolve the latest upstream releases at build time. Dockerfile ARG
+  # defaults are only fallbacks for local/offline builds.
+  versions:
+    runs-on: ubuntu-latest
+    outputs:
+      runner: ${{ steps.v.outputs.runner }}
+      hooks: ${{ steps.v.outputs.hooks }}
+      docker: ${{ steps.v.outputs.docker }}
+      compose: ${{ steps.v.outputs.compose }}
+      date: ${{ steps.v.outputs.date }}
+      owner: ${{ steps.v.outputs.owner }}
+    steps:
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          latest() { gh api "repos/$1/releases/latest" -q .tag_name; }
+          runner="$(latest actions/runner | sed 's/^v//')" || runner=2.336.0
+          hooks="$(latest actions/runner-container-hooks | sed 's/^v//')" || hooks=0.8.1
+          compose="$(latest docker/compose)" || compose=v5.5.0
+          docker="$(curl -fsSL https://download.docker.com/linux/static/stable/x86_64/ \
+                    | grep -o 'docker-[0-9][0-9.]*[0-9]\.tgz' | sed 's/^docker-//;s/\.tgz$//' \
+                    | sort -uV | tail -1)" || docker=29.7.2
+          {
+            echo "runner=$runner"
+            echo "hooks=$hooks"
+            echo "docker=$docker"
+            echo "compose=$compose"
+            echo "date=$(date -u +%Y%m%d)"
+            # ghcr/OCI repository names must be lowercase
+            echo "owner=${GITHUB_REPOSITORY_OWNER,,}"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  # ------------------------------------------------------------------ builds
+  runner-base:
+    needs: versions
+    uses: ./.github/workflows/_build-image.yml
+    with:
+      image: runner-base
+      dockerfile: images/runner-base.Dockerfile
+      no-cache: ${{ github.event_name == 'schedule' }}
+      build-args: |
+        RUNNER_VERSION=${{ needs.versions.outputs.runner }}
+        RUNNER_CONTAINER_HOOKS_VERSION=${{ needs.versions.outputs.hooks }}
+
+  texlive-slim:
+    needs: versions
+    uses: ./.github/workflows/_build-image.yml
+    with:
+      image: texlive-slim
+      dockerfile: texlive/Dockerfile
+      no-cache: ${{ github.event_name == 'schedule' }}
+
+  runner-dind:
+    needs: [versions, runner-base]
+    uses: ./.github/workflows/_build-image.yml
+    with:
+      image: runner-dind
+      dockerfile: images/runner-dind.Dockerfile
+      no-cache: ${{ github.event_name == 'schedule' }}
+      build-args: |
+        BASE_IMAGE=ghcr.io/${{ needs.versions.outputs.owner }}/runner-base:build-${{ github.run_id }}
+        DOCKER_VERSION=${{ needs.versions.outputs.docker }}
+        COMPOSE_VERSION=${{ needs.versions.outputs.compose }}
+
+  runner-texlive:
+    needs: [versions, runner-base, texlive-slim]
+    uses: ./.github/workflows/_build-image.yml
+    with:
+      image: runner-texlive
+      dockerfile: images/runner-texlive.Dockerfile
+      no-cache: ${{ github.event_name == 'schedule' }}
+      build-args: |
+        BASE_IMAGE=ghcr.io/${{ needs.versions.outputs.owner }}/runner-base:build-${{ github.run_id }}
+        TEXLIVE_IMAGE=ghcr.io/${{ needs.versions.outputs.owner }}/texlive-slim:build-${{ github.run_id }}
+
+  # ------------------------------------------------------------------- tests
+  # All tests run natively on both architectures.
+  test-runner-base:
+    needs: [versions, runner-base]
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    env:
+      IMAGE: ghcr.io/${{ needs.versions.outputs.owner }}/runner-base:build-${{ github.run_id }}
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Structural checks
+        run: |
+          docker run --rm -e EXPECTED='${{ needs.versions.outputs.runner }}' "$IMAGE" bash -ec '
+            test "$(id -u)" = 1001
+            ./config.sh --version | grep -qx "$EXPECTED"
+            gh --version >/dev/null
+            git --version >/dev/null
+            jq --version >/dev/null
+            git lfs version >/dev/null
+            dumb-init --version
+            test -f /home/runner/k8s/index.js
+            test -O /home/runner
+            echo "runner-base structural checks passed (runner $EXPECTED, $(uname -m))"
+          '
+
+  test-texlive-slim:
+    needs: [versions, texlive-slim]
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    env:
+      IMAGE: ghcr.io/${{ needs.versions.outputs.owner }}/texlive-slim:build-${{ github.run_id }}
+      # Uncompressed size budget (catches collection creep)
+      TEXLIVE_SIZE_BUDGET_MB: 650
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Size budget
+        run: |
+          docker pull -q "$IMAGE"
+          size_mb=$(( $(docker image inspect -f '{{.Size}}' "$IMAGE") / 1000000 ))
+          echo "texlive-slim uncompressed size: ${size_mb}MB (budget ${TEXLIVE_SIZE_BUDGET_MB}MB)"
+          test "$size_mb" -le "$TEXLIVE_SIZE_BUDGET_MB"
+      - name: Smoke tests (incl. on-demand install)
+        run: ./tests/smoke.sh "$IMAGE"
+
+  test-runner-dind:
+    needs: [versions, runner-dind]
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    env:
+      IMAGE: ghcr.io/${{ needs.versions.outputs.owner }}/runner-dind:build-${{ github.run_id }}
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Rootless docker boots and runs a container
+        run: |
+          docker run -d --name dind --privileged "$IMAGE" bash -c \
+            'dockerd-rootless.sh >/tmp/dockerd.log 2>&1 & sleep infinity'
+          ok=0
+          for i in $(seq 1 30); do
+            if docker exec dind docker info >/dev/null 2>&1; then ok=1; break; fi
+            sleep 2
+          done
+          if [ "$ok" != 1 ]; then
+            echo "rootless dockerd failed to start"; docker exec dind cat /tmp/dockerd.log || true; exit 1
+          fi
+          docker exec dind docker run --rm hello-world
+          docker exec dind docker compose version
+          docker rm -f dind
+
+  test-runner-texlive:
+    needs: [versions, runner-texlive]
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    env:
+      IMAGE: ghcr.io/${{ needs.versions.outputs.owner }}/runner-texlive:build-${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # The critical path texlive-slim's tests don't cover: on-demand tlmgr
+      # installs as uid 1001 (proves tree + /usr/local/bin ownership).
+      - name: texbuild on-demand install as runner user
+        run: |
+          docker run --rm -v "$PWD/tests/texlive:/src:ro" "$IMAGE" bash -ec '
+            test "$(id -u)" = 1001
+            test -w "$(kpsewhich -var-value TEXMFDIST)"
+            cp /src/* "$HOME"/ && cd "$HOME"
+            texbuild basic-lualatex.tex
+            texbuild --pdflatex basic-pdflatex.tex
+            texbuild ondemand.tex
+            head -c4 ondemand.pdf | grep -q "%PDF"
+            grep -q fontawesome5 texbuild-packages.txt
+            echo "runner-texlive on-demand install as uid 1001 OK ($(uname -m))"
+          '
+
+  # Live canary: register the candidate runner-base as an ephemeral
+  # self-hosted runner against this repo and run a real job on it — on both
+  # architectures. Needs the RUNNER_TEST_PAT secret (fine-grained PAT for
+  # this repo: Administration read/write + Actions read/write). Skips with a
+  # warning until the secret exists so promotion isn't blocked.
+  test-live-runner:
+    needs: [versions, runner-base]
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    env:
+      IMAGE: ghcr.io/${{ needs.versions.outputs.owner }}/runner-base:build-${{ github.run_id }}
+      LABEL: canary-${{ github.run_id }}-${{ matrix.arch }}
+      GH_TOKEN: ${{ secrets.RUNNER_TEST_PAT }}
+    steps:
+      - id: gate
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::RUNNER_TEST_PAT not set - live runner test skipped"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: docker/login-action@v3
+        if: steps.gate.outputs.skip != 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Register ephemeral canary runner
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          REG_TOKEN="$(gh api -X POST "repos/${{ github.repository }}/actions/runners/registration-token" -q .token)"
+          echo "::add-mask::$REG_TOKEN"
+          docker run -d --name canary -e REG_TOKEN="$REG_TOKEN" -e LABEL="$LABEL" "$IMAGE" bash -c '
+            ./config.sh --url "https://github.com/${{ github.repository }}" --token "$REG_TOKEN" \
+              --name "$LABEL" --labels "$LABEL" --no-default-labels \
+              --ephemeral --unattended && ./run.sh'
+          for i in $(seq 1 30); do
+            state="$(gh api "repos/${{ github.repository }}/actions/runners" \
+              -q ".runners[] | select(.name==\"$LABEL\") | .status" || true)"
+            [ "$state" = "online" ] && exit 0
+            sleep 4
+          done
+          echo "canary runner never came online"; docker logs canary; exit 1
+      - name: Dispatch canary job and wait
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          gh workflow run canary.yml --ref "${{ github.ref_name }}" \
+            -R "${{ github.repository }}" -f label="$LABEL"
+          run_id=""
+          for i in $(seq 1 30); do
+            run_id="$(gh run list -R "${{ github.repository }}" --workflow=canary.yml \
+              --json databaseId,displayTitle \
+              -q ".[] | select(.displayTitle==\"canary $LABEL\") | .databaseId" | head -1)"
+            [ -n "$run_id" ] && break
+            sleep 5
+          done
+          test -n "$run_id" || { echo "canary run not found"; exit 1; }
+          timeout 480 gh run watch "$run_id" -R "${{ github.repository }}" --exit-status
+      - name: Cleanup
+        if: always() && steps.gate.outputs.skip != 'true'
+        run: |
+          docker rm -f canary 2>/dev/null || true
+          # ephemeral runners deregister after their job; clean up if it never ran one
+          rid="$(gh api "repos/${{ github.repository }}/actions/runners" \
+            -q ".runners[] | select(.name==\"$LABEL\") | .id" || true)"
+          if [ -n "$rid" ]; then
+            gh api -X DELETE "repos/${{ github.repository }}/actions/runners/$rid" || true
+          fi
+
+  # ----------------------------------------------------------------- promote
+  promote:
+    runs-on: ubuntu-latest
+    needs:
+      - versions
+      - test-runner-base
+      - test-texlive-slim
+      - test-runner-dind
+      - test-runner-texlive
+      - test-live-runner
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Promote candidates
+        run: |
+          set -euo pipefail
+          OWNER="${{ needs.versions.outputs.owner }}"
+          DATE="${{ needs.versions.outputs.date }}"
+          RUNNER_V="${{ needs.versions.outputs.runner }}"
+          for img in runner-base runner-dind runner-texlive texlive-slim; do
+            src="ghcr.io/$OWNER/$img:build-${{ github.run_id }}"
+            tags=(-t "ghcr.io/$OWNER/$img:latest" -t "ghcr.io/$OWNER/$img:$DATE")
+            case "$img" in
+              runner-*) tags+=(-t "ghcr.io/$OWNER/$img:runner-$RUNNER_V") ;;
+            esac
+            echo "Promoting $src"
+            docker buildx imagetools create "${tags[@]}" "$src"
+          done

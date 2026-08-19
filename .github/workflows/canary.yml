@@ -1,0 +1,29 @@
+name: canary
+run-name: canary ${{ inputs.label }}
+
+# Dispatched by the build pipeline's test-live-runner job. Runs a trivial
+# job on the freshly built candidate runner image to prove GitHub will
+# assign and complete jobs on it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      label:
+        description: unique label of the ephemeral canary runner
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    runs-on: ${{ inputs.label }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4   # exercises the runner's bundled node
+      - run: |
+          echo "canary on $(hostname), uid $(id -u), $(uname -m)"
+          gh --version
+          git --version
+          jq --version

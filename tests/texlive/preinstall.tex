@@ -1,0 +1,7 @@
+% Preinstall test: preinstall.packages next to this file lists csquotes;
+% texbuild must install it BEFORE the first compile pass.
+\documentclass{article}
+\usepackage{csquotes}          % latexextra, listed in preinstall.packages
+\begin{document}
+\enquote{Preinstalled from the package list.}
+\end{document}
